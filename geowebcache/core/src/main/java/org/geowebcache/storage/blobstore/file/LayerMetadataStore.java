@@ -34,6 +34,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
@@ -47,6 +48,7 @@ import org.geowebcache.util.SuppressFBWarnings;
 
 public class LayerMetadataStore {
 
+    // REWRITE using in memory store for metadata and flush async
     private static Log log =
             LogFactory.getLog(org.geowebcache.storage.blobstore.file.LayerMetadataStore.class);
 
@@ -68,8 +70,10 @@ public class LayerMetadataStore {
 
     private File tmp;
 
+    private static final long LOCK_TIMEOUT_MS = 10000L;
+
     /** number of locks, make it configurable maybe */
-    private static final int lockShardSize = 32;
+    private static final int lockShardSize = 1024;
 
     /** handling of local-process concurrent access to layer metadata files */
     private ReadWriteLock[] locks =
@@ -147,6 +151,39 @@ public class LayerMetadataStore {
         return locks[resolveLockBucket(file)];
     }
 
+    private ReadWriteLock acquireReadLock(File file) {
+        ReadWriteLock lock = getLock(file);
+        boolean acquired = false;
+        try {
+            acquired = lock.readLock().tryLock(LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            // We do not care
+        }
+
+        if (acquired) {
+            return lock;
+        } else {
+            throw new RuntimeException("Unable to acquire read lock for:" + file.getAbsolutePath());
+        }
+    }
+
+    private ReadWriteLock acquireWriteLock(File file) {
+        ReadWriteLock lock = getLock(file);
+        boolean acquired = false;
+        try {
+            acquired = lock.writeLock().tryLock(LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            // We do not care
+        }
+
+        if (acquired) {
+            return lock;
+        } else {
+            throw new RuntimeException(
+                    "Unable to acquire write lock for:" + file.getAbsolutePath());
+        }
+    }
+
     /**
      * Performs the actual update of the metatada, making sure only the provided key/value pair is
      * updated in case another process modified the metadata file since it was loaded by the caller
@@ -157,14 +194,14 @@ public class LayerMetadataStore {
     @SuppressFBWarnings(value = "DLS_DEAD_LOCAL_STORE")
     private void writeMetadataOptimisticLock(
             final String key, final String value, final File metadataFile) throws IOException {
-        final ReadWriteLock rwLock = getLock(metadataFile);
         final int maxAttempts = LayerMetadataStore.METADATA_MAX_RW_ATTEMPTS;
         Properties metadata = loadLayerMetadata(metadataFile);
         long lastModified = metadataFile.lastModified();
 
         log.debug("Start attempt to add key (key: " + key + ")");
 
-        rwLock.writeLock().lock();
+        final ReadWriteLock rwLock = acquireWriteLock(metadataFile);
+
         try {
             createParentIfNeeded(metadataFile);
             int attempt = 0;
@@ -246,8 +283,7 @@ public class LayerMetadataStore {
      * @throws IOException
      */
     private File writeMetadataFile(Properties metadata, File metadataFile) throws IOException {
-        final ReadWriteLock lock = getLock(metadataFile);
-        lock.writeLock().lock();
+        final ReadWriteLock lock = acquireWriteLock(metadataFile);
         try {
             createParentIfNeeded(metadataFile);
             String comments = "auto generated file, do not edit by hand";
@@ -284,8 +320,7 @@ public class LayerMetadataStore {
         final int maxAttempts = LayerMetadataStore.METADATA_MAX_RW_ATTEMPTS;
         long lastModified = metadataFile.lastModified();
         // local-process concurrency control
-        final ReadWriteLock lock = getLock(metadataFile);
-        lock.readLock().lock();
+        final ReadWriteLock lock = acquireReadLock(metadataFile);
         try {
             int attempt = 0;
             for (attempt = 0; metadataFile.exists() && attempt < maxAttempts; attempt++) {
@@ -375,11 +410,9 @@ public class LayerMetadataStore {
             return newMetadataFile;
         }
 
-        final ReadWriteLock newFileLock = getLock(newMetadataFile);
-        final ReadWriteLock oldFileLock = getLock(oldMetadataFile);
-        newFileLock.writeLock().lock();
+        final ReadWriteLock newFileLock = acquireWriteLock(newMetadataFile);
         try {
-            oldFileLock.writeLock().lock();
+            final ReadWriteLock oldFileLock = acquireWriteLock(oldMetadataFile);
             try {
                 if (!oldMetadataFile.exists()) {
                     return newMetadataFile;
@@ -398,7 +431,9 @@ public class LayerMetadataStore {
                                 + e.getMessage());
                 throw new UncheckedIOException(e);
             } finally {
-                oldFileLock.writeLock().unlock();
+                if (oldFileLock != null) {
+                    oldFileLock.writeLock().unlock();
+                }
             }
         } finally {
             newFileLock.writeLock().unlock();
