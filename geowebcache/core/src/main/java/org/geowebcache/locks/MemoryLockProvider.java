@@ -14,6 +14,8 @@
  */
 package org.geowebcache.locks;
 
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.logging.Log;
@@ -44,25 +46,63 @@ public class MemoryLockProvider implements LockProvider {
 
     public Lock getLock(String lockKey) {
         final int idx = getIndex(lockKey);
+        java.util.concurrent.locks.Lock lock = locks[idx];
         if (LOGGER.isDebugEnabled())
             LOGGER.debug("Mapped lock key " + lockKey + " to index " + idx + ". Acquiring lock.");
-        locks[idx].lock();
+        lock.lock();
         if (LOGGER.isDebugEnabled())
             LOGGER.debug("Mapped lock key " + lockKey + " to index " + idx + ". Lock acquired");
 
-        return new Lock() {
+        return new InternalLock(lock, lockKey, idx);
+    }
 
-            boolean released = false;
+    public Lock getLock(String lockKey, long timeout) throws GeoWebCacheException {
+        if (timeout <= 0) {
+            return getLock(lockKey);
+        } else {
+            try {
+                int index = getIndex(lockKey);
+                final java.util.concurrent.locks.Lock lock = locks[index];
 
-            public void release() throws GeoWebCacheException {
-                if (!released) {
-                    released = true;
-                    locks[idx].unlock();
-                    if (LOGGER.isDebugEnabled())
-                        LOGGER.debug("Released lock key " + lockKey + " mapped to index " + idx);
+                boolean acquired = false;
+                try {
+                    acquired = lock.tryLock(timeout, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
                 }
+
+                if (acquired) {
+                    return new InternalLock(lock, lockKey, index);
+                } else {
+                    throw new RuntimeException("Unable to acquire lock for: " + lockKey);
+                }
+            } catch (IllegalArgumentException e) {
+                throw new RuntimeException(e);
             }
-        };
+        }
+    }
+
+    private static class InternalLock implements Lock {
+        private boolean released = false;
+        private final java.util.concurrent.locks.Lock lock;
+        private final String lockKey;
+        private final int index;
+
+        public InternalLock(java.util.concurrent.locks.Lock lock, String lockKey, int index) {
+            this.lock = lock;
+            this.lockKey = lockKey;
+            this.index = index;
+        }
+
+        @Override
+        public void release() throws GeoWebCacheException {
+            if (!released) {
+                released = true;
+                lock.unlock();
+                if (LOGGER.isDebugEnabled())
+                    LOGGER.debug("Released lock key " + lockKey + " mapped to index " + index);
+            }
+        }
     }
 
     private int getIndex(String lockKey) {

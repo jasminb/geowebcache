@@ -26,6 +26,10 @@ public interface LockProvider {
     /** Acquires a exclusive lock on the specified key */
     public Lock getLock(String lockKey) throws GeoWebCacheException;
 
+    default Lock getLock(String key, long timeout) throws GeoWebCacheException {
+        return getLock(key);
+    }
+
     public interface Lock {
         /** Releases the lock on the specified key */
         public void release() throws GeoWebCacheException;
