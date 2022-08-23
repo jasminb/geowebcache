@@ -142,7 +142,7 @@ public class FileBlobStore implements BlobStore {
         }
 
         stagingArea = new File(path, "_gwc_in_progress_deletes_");
-        layerMetadata = new LayerMetadataStore(path, tmp);
+        layerMetadata = new LayerMetadataStore(path);
         createDeleteExecutorService();
         issuePendingDeletes();
     }
